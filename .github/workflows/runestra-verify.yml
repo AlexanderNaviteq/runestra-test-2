@@ -1,0 +1,189 @@
+# .github/workflows/runestra-verify.yml -- committed by the Console
+# (ADR-0010: createCommitOnBranch, never a direct write to the default
+# branch) and opened as a pull request. workflow_dispatch only fires for a
+# workflow file already on the DEFAULT branch, so this file dispatches
+# nothing until a human on the client side merges the pull request that
+# carries it -- see domain/connections/workflow.py's own docstring.
+#
+# This is a TEMPLATE, not the file that ends up in a client's repository
+# verbatim: render_verification_workflow substitutes the two placeholders
+# below (CONSOLE_INGEST_ORIGIN, CONSOLE_INGEST_AUDIENCE, each wrapped in a
+# single dollar sign and braces) before the result is committed. Every
+# other dollar sign in this file -- GitHub Actions' own double-brace
+# expression syntax, the ACTIONS_ID_TOKEN_REQUEST environment variables,
+# the jq and bash substitutions below -- is written as a DOUBLED dollar
+# sign in this template, so the substitution step restores each pair to a
+# single dollar sign verbatim rather than trying, and failing, to resolve
+# it as a placeholder of its own. The verify-oci job also carries two more
+# placeholders: its optional environment line, filled from the rule shape,
+# and the identity-domain host pattern, filled from oci_constants.
+#
+# The Console's own ingest origin and audience are baked into this file by
+# the generator, never carried as workflow_dispatch inputs: an input is
+# attacker-influenceable by anyone who can dispatch this workflow, and a
+# Console URL that arrived as an input would be a Console URL a client could
+# point elsewhere.
+name: Runestra cloud verification
+on:
+  workflow_dispatch:
+    inputs:
+      cloud:
+        description: The cloud the pasted role belongs to
+        required: true
+      role:
+        description: The role ARN to assume
+        required: true
+      region:
+        description: The region to assume the role in
+        required: true
+      domain_url:
+        description: The identity domain URL to exchange the token at
+        required: false
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  verify:
+    if: inputs.cloud == 'aws'
+    runs-on: ubuntu-latest
+    steps:
+      # Progress telemetry only, so continue-on-error: a failed ping must not
+      # skip the identity read and the report that resolve the verification.
+      - name: Report that the job started
+        continue-on-error: true
+        run: |
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=runestra-console-ingest" | jq -r .value)
+          curl -sf -X POST "https://console-dev.runestra.naviteq.io/v1/verifications/started" \
+            -H "Authorization: Bearer $TOKEN"
+
+      - name: Assume the role
+        id: assume
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@cbe3b392738ccf3f987d68400dafcf4b0624a56c # v6.2.4
+        with:
+          role-to-assume: ${{ inputs.role }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Read the identity back
+        id: identity
+        continue-on-error: true
+        run: aws sts get-caller-identity > identity.json
+
+      # The role input reaches the script through env only.
+      - name: Read the stack template version
+        id: version
+        continue-on-error: true
+        env:
+          ROLE_ARN: ${{ inputs.role }}
+        run: |
+          value="$(aws iam list-role-tags --role-name "${ROLE_ARN##*/}" \
+            --query "Tags[?Key=='runestra:template-version'].Value | [0]" \
+            --output text 2>/dev/null || true)"
+          [[ "$value" =~ ^[0-9]{1,4}$ ]] || value=""
+          printf '%s' "$value" > template_version.txt
+
+      - name: Report the outcome
+        if: always()
+        run: |
+          # Both files exist only if their step ran; an empty one still slurps.
+          touch template_version.txt
+          touch identity.json
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=runestra-console-ingest" | jq -r .value)
+          curl -sf -X POST "https://console-dev.runestra.naviteq.io/v1/verifications/report" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg o "${{ steps.assume.outcome }}" \
+                        --slurpfile id identity.json \
+                        --rawfile v template_version.txt \
+                        '{assume_outcome:$o, identity:($id[0] // null)}
+                         + (if $v != "" then {template_version:$v} else {} end)')"
+
+  verify-oci:
+    if: inputs.cloud == 'oci'
+    runs-on: ubuntu-latest
+    steps:
+      # Progress telemetry only; the report below resolves the verification.
+      - name: Report that the job started
+        continue-on-error: true
+        run: |
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=runestra-console-ingest" | jq -r .value)
+          curl -sf -X POST "https://console-dev.runestra.naviteq.io/v1/verifications/started" \
+            -H "Authorization: Bearer $TOKEN"
+
+      # The secret and the inputs reach the script through env only.
+      - name: Exchange the GitHub token for an OCI session
+        id: exchange
+        continue-on-error: true
+        env:
+          OIDC_DOMAIN_URL: ${{ inputs.domain_url }}
+          OIDC_CLIENT_ID: ${{ inputs.role }}
+          OIDC_CLIENT_SECRET: ${{ secrets.RUNESTRA_OCI_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          domain_url="${OIDC_DOMAIN_URL%/}"
+          # Refuse any host the secret must not be sent to, before a request.
+          pattern='^https://idcs-[a-z0-9]+\.(identity\.oraclecloud\.com|[a-z]+-[a-z]+-idcs-[0-9]+\.identity\.[a-z]+-[a-z]+-[0-9]+\.oci\.oraclecloud\.com)$'
+          if [[ ! "$domain_url" =~ $pattern ]]; then
+            echo "::error::The identity domain URL is not an Oracle identity domain host." >&2
+            exit 1
+          fi
+          # The token audience is the identity domain URL itself. Not -f: it would hide the status.
+          github_response="$(mktemp)"
+          github_status="$(curl -sS -o "$github_response" -w '%{http_code}' \
+            -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${domain_url}" || true)"
+          github_token="$(jq -r '.value // empty' < "$github_response" 2>/dev/null || true)"
+          rm -f "$github_response"
+          if [[ -z "$github_token" ]]; then
+            echo "::error::GitHub returned HTTP $github_status and no token for the identity domain." >&2
+            exit 1
+          fi
+          echo "::add-mask::$github_token"
+          # An ephemeral key, sent as its bare base64 body: a PEM with header lines is rejected.
+          key_dir="$(mktemp -d)"
+          chmod 700 "$key_dir"
+          openssl genrsa -out "$key_dir/key.pem" 2048 >/dev/null 2>&1
+          openssl rsa -pubout -in "$key_dir/key.pem" -out "$key_dir/key_public.pem" >/dev/null 2>&1
+          public_key="$(grep -v -- '-----' "$key_dir/key_public.pem" | tr -d '\n')"
+          # The client secret and the token go to curl as a config on stdin, never as arguments.
+          credentials="$OIDC_CLIENT_ID:$OIDC_CLIENT_SECRET"
+          credentials="${credentials//\\/\\\\}"
+          credentials="${credentials//\"/\\\"}"
+          exchange_response="$key_dir/response.json"
+          exchange_status="$(printf 'user = "%s"\ndata-urlencode = "subject_token=%s"\n' \
+              "$credentials" "$github_token" \
+            | curl -sS -K - -o "$exchange_response" -w '%{http_code}' -X POST "$domain_url/oauth2/v1/token" \
+              --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
+              --data-urlencode "requested_token_type=urn:oci:token-type:oci-upst" \
+              --data-urlencode "subject_token_type=jwt" \
+              --data-urlencode "public_key=$public_key" || true)"
+          session_token="$(jq -r '.token // empty' < "$exchange_response" 2>/dev/null || true)"
+          if [[ "$exchange_status" != "200" || -z "$session_token" ]]; then
+            echo "::error::The token exchange returned HTTP $exchange_status and no session token." >&2
+            if [[ "$exchange_status" != "200" ]]; then
+              echo "  response body: $(tr -d '\n' < "$exchange_response")" >&2
+            fi
+            exit 1
+          fi
+          echo "::add-mask::$session_token"
+          # The identity is the session token's own non-secret claims, decoded here.
+          payload="$(printf '%s' "$session_token" | cut -d. -f2 | tr '_-' '/+')"
+          while (( ${#payload} % 4 )); do payload="${payload}="; done
+          printf '%s' "$payload" | base64 -d | jq -c '{iss, sub, source_authn_prin, exp}' > identity.json
+
+      - name: Report the outcome
+        if: always()
+        env:
+          EXCHANGE_OUTCOME: ${{ steps.exchange.outcome }}
+        run: |
+          # An empty file slurps to `[]`, so a failed exchange still reports.
+          touch identity.json
+          TOKEN=$(curl -sf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=runestra-console-ingest" | jq -r .value)
+          curl -sf -X POST "https://console-dev.runestra.naviteq.io/v1/verifications/report" \
+            -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+            -d "$(jq -n --arg o "$EXCHANGE_OUTCOME" \
+                        --slurpfile id identity.json \
+                        '{assume_outcome:$o, identity:($id[0] // null)}')"
