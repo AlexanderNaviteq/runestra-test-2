@@ -1,0 +1,314 @@
+# .github/workflows/runestra-run.yml, committed by the Console and rendered from this template.
+# Four dollar-brace placeholders are substituted; every other dollar sign is doubled here.
+# Origin and audience are baked in, never dispatch inputs.
+name: Runestra run
+run-name: runestra ${{ inputs.run_id }} ${{ inputs.correlation_nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: Console run id
+        required: true
+      environment_id:
+        description: Console environment id
+        required: true
+      phase:
+        description: Run phase
+        required: true
+      catalog_sha:
+        description: Catalog commit the environment was rendered from
+        required: true
+      correlation_nonce:
+        description: Correlation nonce
+        required: true
+permissions: {}
+jobs:
+  preflight:
+    name: preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      id-token: write
+      contents: read
+    # The runner drops a job output that contains a secret, so the role travels as account and name.
+    outputs:
+      environment_path: ${{ steps.resolve.outputs.environment_path }}
+      aws_region: ${{ steps.resolve.outputs.aws_region }}
+      has_manifest_role: ${{ steps.resolve.outputs.has_manifest_role }}
+      aws_role_account: ${{ steps.resolve.outputs.aws_role_account }}
+      aws_role_name: ${{ steps.resolve.outputs.aws_role_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The id is validated as a UUID before it forms a path; path, region and role are checked too.
+      - name: Resolve the environment
+        id: resolve
+        continue-on-error: true
+        env:
+          ENVIRONMENT_ID: ${{ inputs.environment_id }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$ENVIRONMENT_ID" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+            echo "::error::The environment id is not a UUID."
+            exit 1
+          fi
+          manifest=".runestra/environments/${ENVIRONMENT_ID}.json"
+          if [[ ! -f "$manifest" ]]; then
+            echo "::error::The environment manifest is missing from the repository."
+            exit 1
+          fi
+          if ! jq -e --arg id "$ENVIRONMENT_ID" '.environment_id == $id' "$manifest" > /dev/null; then
+            echo "::error::The manifest belongs to another environment."
+            exit 1
+          fi
+          path="$(jq -r '.path | select(type == "string")' "$manifest")"
+          region="$(jq -r '.region | select(type == "string")' "$manifest")"
+          if [[ ! "$path" =~ ^terragrunt/[A-Za-z0-9._/-]*$ || "$path" == *..* ]]; then
+            echo "::error::The manifest path is not under terragrunt/."
+            exit 1
+          fi
+          if [[ ! "$region" =~ ^[a-z]{2}(-[a-z]+)+-[0-9]+$ ]]; then
+            echo "::error::The manifest region is not a region name."
+            exit 1
+          fi
+          aws_role="$(jq -r '.aws_role | select(type == "string")' "$manifest")"
+          has_manifest_role=false
+          role_account=""
+          role_name=""
+          if [[ -n "$aws_role" ]]; then
+            if [[ ! "$aws_role" =~ ^arn:aws:iam::([0-9]+):role/(.+)$ ]]; then
+              echo "::error::The manifest role is not an IAM role ARN."
+              exit 1
+            fi
+            role_account="${BASH_REMATCH[1]}"
+            role_name="${BASH_REMATCH[2]}"
+            if [[ ! "$role_account" =~ ^[0-9]{12}$ || ! "$role_name" =~ ^[A-Za-z0-9+=,.@_-]{1,64}$ ]]; then
+              echo "::error::The manifest role is not an IAM role ARN."
+              exit 1
+            fi
+            has_manifest_role=true
+          fi
+          {
+            echo "environment_path=$path"
+            echo "aws_region=$region"
+            echo "has_manifest_role=$has_manifest_role"
+            echo "aws_role_account=$role_account"
+            echo "aws_role_name=$role_name"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare the event files
+        if: always()
+        run: |
+          : > "$RUNNER_TEMP/runestra-preflight.ndjson"
+          cat > "$RUNNER_TEMP/runestra-record.sh" <<'SH'
+          record() {
+            jq -cn --arg c "$1" --arg s "$2" --arg o "$3" --arg k "${4:-}" \
+              '{type: "preflight.check", payload: ({check: $c, status: $s, owner: $o} + (if $k == "" then {} else {code: $k} end))}' \
+              >> "$RUNNER_TEMP/runestra-preflight.ndjson"
+          }
+          SH
+          printf '%s\n' \
+            '{"type": "run.units.seeded", "payload": {"phases": ["Preflight", "Apply the stack"]}}' \
+            '{"type": "run.phase.started", "payload": {"phase": "Preflight"}}' \
+            > "$RUNNER_TEMP/runestra-declare.ndjson"
+
+      # First emitter of the run: both phases are declared once, before any phase event.
+      - name: Declare the phases
+        if: always()
+        uses: naviteq/github-actions/.github/actions/console-events@mirror/preview-pr566-edb3f39
+        with:
+          console_url: https://console-dev.runestra.naviteq.io
+          console_audience: runestra-console-ingest
+          console_run_id: ${{ inputs.run_id }}
+          events_file: ${{ runner.temp }}/runestra-declare.ndjson
+
+      - name: Check the registry credentials
+        id: registry
+        continue-on-error: true
+        env:
+          RUNESTRA_CLIENT_ID: ${{ secrets.RUNESTRA_CLIENT_ID }}
+          RUNESTRA_CLIENT_SECRET: ${{ secrets.RUNESTRA_CLIENT_SECRET }}
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          if [[ -z "$RUNESTRA_CLIENT_ID" || -z "$RUNESTRA_CLIENT_SECRET" ]]; then
+            record registry_secret fail client registry_secret_missing
+            exit 0
+          fi
+          response="$(mktemp)"
+          status="$(jq -cn '{client_id: env.RUNESTRA_CLIENT_ID, client_secret: env.RUNESTRA_CLIENT_SECRET}' \
+            | curl -sS --max-time 30 -o "$response" -w '%{http_code}' -X POST \
+              -H 'Content-Type: application/json' --data-binary @- \
+              https://registry.runestra.naviteq.io/api/v1/auth 2> /dev/null || true)"
+          case "$status" in
+            200)
+              if jq -e '.access_token | type == "string" and length > 0' "$response" > /dev/null 2>&1; then
+                record registry_secret pass client
+              else
+                record registry_secret fail runner registry_unreachable
+              fi ;;
+            401 | 403) record registry_secret fail client registry_credentials_refused ;;
+            429) record registry_secret fail naviteq registry_rate_limited ;;
+            *) record registry_secret fail runner registry_unreachable ;;
+          esac
+          rm -f "$response"
+
+      # The legacy secret is only a fallback for environments whose manifest names no role.
+      - name: Check that a role is available
+        id: role
+        continue-on-error: true
+        env:
+          HAS_MANIFEST_ROLE: ${{ steps.resolve.outputs.has_manifest_role }}
+          HAS_LEGACY_ROLE: ${{ secrets.AWS_IAM_ROLE != '' }}
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          if [[ "$HAS_MANIFEST_ROLE" != "true" && "$HAS_LEGACY_ROLE" != "true" ]]; then
+            record oidc_role fail client aws_role_missing
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Assume the role
+        id: assume
+        if: steps.role.outputs.present == 'true' && steps.resolve.outcome == 'success'
+        continue-on-error: true
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ steps.resolve.outputs.has_manifest_role != 'false' && format('arn:aws:iam::{0}:role/{1}', steps.resolve.outputs.aws_role_account, steps.resolve.outputs.aws_role_name) || secrets.AWS_IAM_ROLE }}
+          aws-region: ${{ steps.resolve.outputs.aws_region }}
+
+      # The identity is read back to prove the role works and is discarded, never printed.
+      - name: Check that the role is assumable
+        id: identity
+        if: steps.role.outputs.present == 'true' && steps.resolve.outcome == 'success'
+        continue-on-error: true
+        env:
+          ASSUME_OUTCOME: ${{ steps.assume.outcome }}
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          if [[ "$ASSUME_OUTCOME" == "success" ]] && aws sts get-caller-identity > /dev/null 2>&1; then
+            record oidc_role pass client
+            echo "assumed=true" >> "$GITHUB_OUTPUT"
+          else
+            record oidc_role fail client aws_role_not_assumable
+          fi
+
+      - name: Check that the region is enabled
+        id: region
+        if: steps.identity.outputs.assumed == 'true'
+        continue-on-error: true
+        env:
+          AWS_REGION_NAME: ${{ steps.resolve.outputs.aws_region }}
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          errors="$(mktemp)"
+          if opt_in="$(aws ec2 describe-regions --all-regions --region-names "$AWS_REGION_NAME" \
+            --query 'Regions[0].OptInStatus' --output text 2> "$errors")"; then
+            case "$opt_in" in
+              opt-in-not-required | opted-in) record region_enabled pass client ;;
+              *) record region_enabled fail client region_not_enabled ;;
+            esac
+          elif grep -q 'InvalidParameterValue' "$errors"; then
+            record region_enabled fail client region_not_enabled
+          else
+            record region_enabled fail client role_cannot_read_regions
+          fi
+          rm -f "$errors"
+
+      - name: Ask the Console for a catalog token
+        id: broker
+        continue-on-error: true
+        uses: naviteq/github-actions/.github/actions/catalog-token@mirror/preview-pr566-edb3f39
+        with:
+          console_url: https://console-dev.runestra.naviteq.io
+          console_audience: runestra-console-ingest
+          console_run_id: ${{ inputs.run_id }}
+          fail_on_error: "false"
+
+      - name: Check that the catalog is reachable
+        id: catalog
+        continue-on-error: true
+        env:
+          BROKER_STATUS: ${{ steps.broker.outputs.status }}
+          CATALOG_SHA: ${{ inputs.catalog_sha }}
+          GIT_TERMINAL_PROMPT: "0"
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          case "$BROKER_STATUS" in
+            ok)
+              probe="$(mktemp -d)"
+              git -C "$probe" init -q
+              if [[ "$CATALOG_SHA" =~ ^[0-9a-f]{40}$ ]] \
+                && git -C "$probe" fetch -q --depth=1 \
+                  https://github.com/naviteq-ltd/infrastructure-catalog.git "$CATALOG_SHA" > /dev/null 2>&1; then
+                record catalog_reachable pass naviteq
+              else
+                record catalog_reachable fail runner catalog_not_reachable
+              fi
+              rm -rf "$probe" ;;
+            scope_lost) record catalog_reachable fail naviteq catalog_scope_lost ;;
+            *) record catalog_reachable fail naviteq catalog_broker_unavailable ;;
+          esac
+
+      - name: Report the checks not yet implemented
+        if: always()
+        run: |
+          source "$RUNNER_TEMP/runestra-record.sh"
+          record sso_secrets not_checked client
+          record tailscale_acl not_checked client
+          record dns_delegation not_checked client
+
+      - name: Settle the preflight
+        id: settle
+        if: always()
+        env:
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
+        run: |
+          lines="$RUNNER_TEMP/runestra-preflight.ndjson"
+          failed="$(jq -s '[.[] | select(.payload.status == "fail")] | length' "$lines")"
+          passed="$(jq -s '[.[] | select(.payload.status == "pass")] | length' "$lines")"
+          if [[ "$RESOLVE_OUTCOME" == "success" && "$failed" == "0" && "$passed" == "4" ]]; then
+            echo '{"type": "run.phase.completed", "payload": {"phase": "Preflight"}}' >> "$lines"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Post the preflight events
+        if: always()
+        uses: naviteq/github-actions/.github/actions/console-events@mirror/preview-pr566-edb3f39
+        with:
+          console_url: https://console-dev.runestra.naviteq.io
+          console_audience: runestra-console-ingest
+          console_run_id: ${{ inputs.run_id }}
+          events_file: ${{ runner.temp }}/runestra-preflight.ndjson
+
+      - name: Stop the run when a check failed
+        if: always() && steps.settle.outputs.ok != 'true'
+        run: |
+          echo "::error::Preflight did not pass; the run stops before apply."
+          exit 1
+
+  apply:
+    name: apply
+    needs: preflight
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      issues: write
+    uses: naviteq/github-actions/.github/workflows/terragrunt-apply-fresh.yaml@mirror/preview-pr566-edb3f39
+    with:
+      console_url: https://console-dev.runestra.naviteq.io
+      console_audience: runestra-console-ingest
+      console_run_id: ${{ inputs.run_id }}
+      working_directory: ${{ needs.preflight.outputs.environment_path }}
+      aws_region: ${{ needs.preflight.outputs.aws_region }}
+      expect: '{"allow_replace": false, "allow_destroy": false}'
+    # Only an explicit has_manifest_role of false selects the legacy secret; a lost flag fails closed.
+    secrets:
+      aws_iam_role: ${{ needs.preflight.outputs.has_manifest_role != 'false' && format('arn:aws:iam::{0}:role/{1}', needs.preflight.outputs.aws_role_account, needs.preflight.outputs.aws_role_name) || secrets.AWS_IAM_ROLE }}
+      runestra_client_id: ${{ secrets.RUNESTRA_CLIENT_ID }}
+      runestra_client_secret: ${{ secrets.RUNESTRA_CLIENT_SECRET }}
